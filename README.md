@@ -71,6 +71,38 @@ python scripts/separate.py \
   --checkpoint checkpoints/mussep_distilled_v1.pt \
   --fast-sample True # Utilizes consistency distillation for 2-step sampling
 ```
+## Directory Structure
+
+MusSep/
+├── configs/                  # YAML configs for training, model sizing, and inference
+│   ├── roformer_base.yaml
+│   ├── dit_latent.yaml
+│   └── distillation.yaml
+├── data/                     # Data loading and augmentation for MUSDB18HQ
+│   ├── dataset.py            # MUSDB18HQ wrapper
+│   └── transforms.py         # Stem mixing, pitch shifting, time stretching
+├── models/                   # Core neural network architectures
+│   ├── band_split.py         # Band-splitting logic
+│   ├── roformer.py           # Inter/intra-band RoPE sequence modeling
+│   ├── dac_vae.py            # DAC-VAE bottleneck wrappers
+│   ├── dit.py                # Diffusion Transformer generator
+│   └── flow_matching.py      # Permutation-equivariant flow matching
+├── pipeline/                 # High-level training and inference logic
+│   ├── train_base.py         # Primary stem isolation (Vocal, Drum, Bass)
+│   ├── train_generative.py   # Latent masking & sub-stem generation
+│   ├── train_distill.py      # Consistency distillation for fast inference
+│   └── infer.py              # End-to-end inference script
+├── utils/                    # Metrics, logging, and audio processing
+│   ├── metrics.py            # SDR, SIR, SAR calculations
+│   └── audio.py              # STFT, iSTFT, waveform reconstruction
+├── scripts/                  # CLI entry points
+│   ├── separate.py           # User-facing inference CLI
+│   └── evaluate.py           # Benchmark script for MUSDB18HQ (9.80 dB SDR)
+├── tests/                    # Unit tests for model shapes and pipeline flow
+├── .gitignore
+├── requirements.txt
+├── environment.yml           # Conda environment specification
+└── README.md
 
 ## Training Pipeline
 
