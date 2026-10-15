@@ -72,7 +72,7 @@ python scripts/separate.py \
   --fast-sample True # Utilizes consistency distillation for 2-step sampling
 ```
 ## Directory Structure
-
+```
 MusSep/
 ├── configs/                  # YAML configs for training, model sizing, and inference
 │   ├── roformer_base.yaml
@@ -103,6 +103,7 @@ MusSep/
 ├── requirements.txt
 ├── environment.yml           # Conda environment specification
 └── README.md
+```
 
 ## Training Pipeline
 
