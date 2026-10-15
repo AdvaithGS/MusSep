@@ -43,8 +43,66 @@ Drum separation based on a Hybrid Demucs([HT Demucs](https://arxiv.org/abs/1909.
 Code to facilitate access to the model presented in the thesis "Separación de fuentes en grabaciones de batería mediante aprendizaje automático" (2022).
 The model takes as input an audio file (mp3, wav, flac, or ogg) corresponding to a drum recording and exports 4 audio files classified as - Kick, Snare, Cymbals, Toms
 
-## Proposed Struture
-![This is the structure of the Model](https://arxiv.org/html/2410.20773v1/extracted/5955788/Blank_diagram.png)
+## Installation
+
+I recommend using a Conda environment to manage dependencies, especially for specific PyTorch and DAC versions.
+
+```
+git clone https://github.com/AdvaithGS/MusSep.git
+cd MusSep
+
+# Create and activate the environment
+conda env create -f environment.yml
+conda activate mussep
+
+# Alternatively, using pip
+pip install -r requirements.txt
+```
+
+## Quickstart: Inference
+
+Download the pre-trained weights (links coming soon) and place them in the checkpoints/ directory.
+
+To separate a single track into its constituent stems:
+```
+python scripts/separate.py \
+  --input path/to/mixture.wav \
+  --output path/to/output_dir/ \
+  --checkpoint checkpoints/mussep_distilled_v1.pt \
+  --fast-sample True # Utilizes consistency distillation for 2-step sampling
+```
+
+## Training Pipeline
+
+The training process is modularized into three distinct phases. Ensure your MUSDB18HQ dataset is formatted according to the instructions in data/README.md (to be added).
+
+1. Base Model Training
+Train the Band-Split RoFormer on primary stems.
+```
+python pipeline/train_base.py --config configs/roformer_base.yaml
+```
+
+2. Generative Latent Modeling
+Freeze the base model and train the DiT and Flow Matching components in the DAC latent space.
+```
+python pipeline/train_generative.py --config configs/dit_latent.yaml
+```
+
+3. Consistency Distillation
+Accelerate the generative model for real-time or near-real-time inference.
+```
+python pipeline/train_distill.py --config configs/distillation.yaml
+```
+
+## Benchmarks
+Benchmarks
+
+Model |  MUSDB18HQ SDR (dB) | Inference Speed (RTF)
+MusSep (Base Only) | 8.95 | 0.4x
+MusSep (Full Ensemble) | 9.80 | 1.2x
+MusSep (Distilled) | 9.65 | 0.5x
+
+
 
 ## Datasets and Models Sourcing
 
