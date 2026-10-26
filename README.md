@@ -107,25 +107,38 @@ MusSep/
 
 ## Training Pipeline
 
-The training process is modularized into three distinct phases. Ensure your MUSDB18HQ dataset is formatted according to the instructions in data/README.md (to be added).
+The training process is modularized into three distinct phases. Ensure your MUSDB18HQ dataset is formatted according to the instructions in data/README.md (to be added), isolating the deterministic stem separation from the generative sub-stem modeling.
 
-1. Base Model Training
-Train the Band-Split RoFormer on primary stems.
+### 1. Base Model Training (Primary Stems)
+Train the Band-Split RoFormer to isolate the four primary stems (Vocals, Drums, Bass, Other) directly from the complex spectrogram. This stage strictly utilizes MUSDB18-HQ (alongside any supplemental multi-track data) to optimize toward the target 9.80 dB SDR benchmark.
+```bash
+python pipeline/train_base.py \
+  --config configs/roformer_base.yaml \
+  --dataset musdb18hq \
+  --batch-size 8 \
+  --epochs 100
 ```
-python pipeline/train_base.py --config configs/roformer_base.yaml
+### 2. Generative Latent Modelling (Hierarchical Sub-Stems) 
+Freeze the pre-trained base model weights. In this phase, mixed stems (such as "Other") are encoded into a compressed latent space utilizing the DAC-VAE bottleneck. A Diffusion Transformer (DiT) is then trained via permutation-equivariant flow matching to generate hierarchical sub-stems (e.g., separating distinct guitars and synths). This stage relies on the highly granular stems from MoisesDB and Slakh2100.
+
+```bash
+python pipeline/train_generative.py \
+  --config configs/dit_latent.yaml \
+  --datasets moisesdb,slakh2100 \
+  --freeze-base true \
+  --batch-size 16
 ```
 
-2. Generative Latent Modeling
-Freeze the base model and train the DiT and Flow Matching components in the DAC latent space.
-```
-python pipeline/train_generative.py --config configs/dit_latent.yaml
+### 3. Consistency Distillation (Inference Acceleration)
+To bypass the computationally expensive iterative sampling of standard flow matching, this final stage distills the trained DiT into a fast-sampling student model. This reduces the generation trajectory from $N$ steps down to 1–4 steps, enabling near-real-time hierarchical inference without severe fidelity degradation.
+
+```bash
+python pipeline/train_distill.py \
+  --config configs/distillation.yaml \
+  --teacher-checkpoint checkpoints/dit_flow_latest.pt \
+  --sampling-steps 4
 ```
 
-3. Consistency Distillation
-Accelerate the generative model for real-time or near-real-time inference.
-```
-python pipeline/train_distill.py --config configs/distillation.yaml
-```
 
 ## Benchmarks
 Benchmarks
