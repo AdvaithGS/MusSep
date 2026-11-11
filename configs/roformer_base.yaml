@@ -1,0 +1,19 @@
+model:
+  type: bs_roformer
+  channels: 2
+  hidden_dim: 128
+  num_heads: 8
+  depth: 12
+  # Leave bands undefined to default to the paper's 62-band scheme
+
+audio:
+  sample_rate: 44100
+  n_fft: 2048
+  hop_length: 512
+
+training:
+  batch_size: 4
+  learning_rate: 1e-4
+  mixed_precision: true  # Essential for SDPA / FlashAttention efficiency
+  epochs: 100
+  target_stem: vocals    # E.g., train one model per stem, or "multi" if using a shared base
