@@ -1,0 +1,15 @@
+# Core ML & Tensor Operations (Requires PyTorch 2.0+ for native SDPA and complex tensor support)
+torch>=2.1.0
+torchaudio>=2.1.0
+
+# Pretrained Codecs & Architectures
+transformers>=4.35.0  # Required for Meta's facebook/dacvae-watermarked
+huggingface-hub>=0.19.0
+
+# Configuration & Data Handling
+pyyaml>=6.0
+numpy>=1.24.0
+soundfile>=0.12.1     # Primary backend for torchaudio
+
+# Optional: Accelerated Attention (if hardware compilation is supported)
+# flash-attn>=2.0.0

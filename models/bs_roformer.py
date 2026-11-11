@@ -19,7 +19,11 @@ class BSRoFormer(nn.Module):
             nn.Linear(hidden_dim, (end - start) * 2 * channels)
             for start, end in self.band_split.bands
         ])
-
+        # --- NEW: Safe initialization for the complex mask ---
+        for proj in self.mask_projections:
+            nn.init.normal_(proj.weight, mean=0.0, std=0.01)
+            nn.init.constant_(proj.bias, 0.0)
+        
     def forward(self, x):
         """
         x: Complex STFT spectrogram (B, C, F, T)
