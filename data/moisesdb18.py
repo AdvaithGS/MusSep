@@ -1,116 +1,148 @@
-import torch
-from torch.utils.data import Dataset, DataLoader
-import torchaudio
-import os
-import random
+"""MoisesDB indexer.
 
-class MoisesHierarchicalDataset(Dataset):
+Layout of the official distribution (see ``moisesdb.track.MoisesDBTrack``)::
+
+    <root>/<provider>/<track id>/data.json
+    <root>/<provider>/<track id>/<stemName>/<file id>.<extension>
+
+``data.json`` holds ``stems: [{stemName, tracks: [{id, trackType, extension,
+has_bleed}]}]``. A root that points directly at a folder of track directories
+works too: every ``data.json`` below ``root`` is picked up.
+
+MoisesDB ships no official train / validation split. Ours is deterministic
+and stratified (:func:`stratified_val`): every class that can survive the
+minimum-data rule gets up to ``min_val`` held-out songs, without taking so
+many that its training count drops below the rule's threshold; the rest of
+the held-out set is filled in hash order up to ``val_fraction``. A plain
+random 10% of ~240 songs can easily hold no example of a rare class, which
+would make that class impossible to validate.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+from collections import Counter
+from typing import Dict, List, Optional, Set
+
+from .dataset import HierTrack, SourceFile
+from .taxonomy import Taxonomy
+
+SOURCE = "moisesdb"
+
+
+def split_of(track_id: str, val_fraction: float = 0.1, seed: int = 0) -> str:
+    """Deterministic ``train`` / ``val`` assignment that does not depend on
+    which other tracks are present."""
+    return "val" if _rank(track_id, seed) < val_fraction else "train"
+
+
+def _rank(track_id: str, seed: int) -> float:
+    digest = hashlib.sha1(f"{seed}:{track_id}".encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) / 0xFFFFFFFF
+
+
+def stratified_val(
+    classes_of: Dict[str, Set[str]],
+    val_fraction: float = 0.1,
+    min_songs: int = 20,
+    min_val: int = 2,
+    seed: int = 0,
+) -> Set[str]:
+    """Held-out song ids.
+
+    ``classes_of[song]`` is the set of (candidate) classes in that song. A class
+    with ``n >= min_songs`` songs can survive the minimum-data rule; it gets
+    ``min(min_val, n - min_songs)`` held-out songs, rarest class first, and no
+    song is ever held out if that would push such a class below ``min_songs``
+    training songs. The set is then filled in hash order up to
+    ``round(val_fraction * number of songs)``, under the same constraint.
     """
-    Dataset loader for MoisesDB handling hierarchical sub-stems.
-    Expects directory structure:
-    MoisesDB/
-      track_01/
-        vocals/
-          lead.wav
-          harmony.wav
-        other/
-          guitar.wav
-          piano.wav
-          synth.wav
-    """
-    def __init__(self, root_dir, target_parent="other", segment_length=10, sample_rate=44100):
-        super().__init__()
-        self.root_dir = root_dir
-        self.target_parent = target_parent # The parent stem to split (e.g., 'other')
-        self.segment_samples = segment_length * sample_rate
-        self.sample_rate = sample_rate
-        
-        # Define the global vocabulary for sub-stems (determines stem_labels)
-        # 0 is reserved for padding/empty
-        self.sub_stem_vocab = {
-            "pad": 0,
-            "guitar": 1,
-            "piano": 2,
-            "synth": 3,
-            "strings": 4,
-            "brass": 5,
-            "percussion": 6
-        }
-        self.num_classes = len(self.sub_stem_vocab)
-        self.max_stems = 6 # Maximum number of sub-stems to model jointly
-        
-        # Scan dataset
-        self.tracks = []
-        for track_name in os.listdir(root_dir):
-            track_path = os.path.join(root_dir, track_name, target_parent)
-            if os.path.exists(track_path):
-                sub_stems = [f for f in os.listdir(track_path) if f.endswith('.wav')]
-                if len(sub_stems) > 0:
-                    self.tracks.append({
-                        "path": track_path,
-                        "sub_stems": sub_stems
-                    })
+    if val_fraction <= 0 or not classes_of:
+        return set()
+    total = Counter(c for classes in classes_of.values() for c in classes)
+    cap = {c: n - min_songs for c, n in total.items() if n >= min_songs}
+    order = sorted(classes_of, key=lambda song: (_rank(song, seed), song))
+    val: Set[str] = set()
+    held = Counter()
 
-    def __len__(self):
-        return len(self.tracks)
+    def take(song: str) -> bool:
+        if song in val or any(held[c] >= cap[c] for c in classes_of[song] if c in cap):
+            return False
+        val.add(song)
+        held.update(classes_of[song])
+        return True
 
-    def _load_and_pad(self, file_path):
-        audio, sr = torchaudio.load(file_path)
-        # Handle stereo/mono and resampling if necessary (simplified for draft)
-        if sr != self.sample_rate:
-            audio = torchaudio.functional.resample(audio, sr, self.sample_rate)
-        if audio.shape[0] == 1:
-            audio = audio.repeat(2, 1) # force stereo
-            
-        # Random crop
-        if audio.shape[1] > self.segment_samples:
-            start = random.randint(0, audio.shape[1] - self.segment_samples)
-            audio = audio[:, start:start + self.segment_samples]
-        else:
-            pad_amount = self.segment_samples - audio.shape[1]
-            audio = torch.nn.functional.pad(audio, (0, pad_amount))
-            
-        return audio
+    for c in sorted(cap, key=lambda c: (total[c], c)):
+        quota = min(min_val, cap[c])
+        for song in order:
+            if held[c] >= quota:
+                break
+            if c in classes_of[song]:
+                take(song)
+    target = int(round(val_fraction * len(classes_of)))
+    for song in order:
+        if len(val) >= target:
+            break
+        take(song)
+    return val
 
-    def _map_filename_to_class(self, filename):
-        # Simplified mapping logic
-        name = filename.lower().replace('.wav', '')
-        for key in self.sub_stem_vocab:
-            if key in name and key != "pad":
-                return self.sub_stem_vocab[key]
-        return self.sub_stem_vocab["pad"] # Unknown maps to pad/ignore
 
-    def __getitem__(self, idx):
-        track = self.tracks[idx]
-        
-        # Initialize containers for the joint set
-        # Shape: (Max_Stems, Channels=2, Samples)
-        audio_tensor = torch.zeros(self.max_stems, 2, self.segment_samples)
-        stem_labels = torch.zeros(self.max_stems, dtype=torch.long)
-        valid_mask = torch.zeros(self.max_stems, dtype=torch.bool)
-        
-        # Load available sub-stems up to max_stems
-        # If multiple of the same class exist (e.g., two guitars), they should ideally be merged.
-        # For v1, we take them up to max_stems.
-        num_loaded = min(len(track["sub_stems"]), self.max_stems)
+def index_moisesdb(
+    root: str | Path,
+    taxonomy: Taxonomy,
+    val_fraction: float = 0.1,
+    seed: int = 0,
+    min_val: int = 2,
+    min_songs: Optional[int] = None,
+) -> List[HierTrack]:
+    """Returns one :class:`HierTrack` per song, files labelled with their
+    parent and *candidate* class, split by :func:`stratified_val`.
 
-        parent_path = os.path.join(track["path"], f"../{self.target_parent}.wav") 
-        if os.path.exists(parent_path):
-            parent_audio = self._load_and_pad(parent_path)
-        else:
-            parent_audio = torch.zeros(2, self.segment_samples)
-
-        for i in range(num_loaded):
-            file_name = track["sub_stems"][i]
-            file_path = os.path.join(track["path"], file_name)
-            
-            audio = self._load_and_pad(file_path)
-            class_id = self._map_filename_to_class(file_name)
-            
-            if class_id != self.sub_stem_vocab["pad"]:
-                audio_tensor[i] = audio
-                stem_labels[i] = class_id
-                valid_mask[i] = True
-                
-        return parent_audio, audio_tensor, stem_labels, valid_mask
-
+    The split depends only on candidate classes, so indexing with the
+    candidate or the frozen taxonomy gives the same split. ``min_songs``
+    defaults to the taxonomy's minimum-data threshold."""
+    root = Path(root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"MoisesDB folder not found: {root}")
+    tracks: List[HierTrack] = []
+    for meta_path in sorted(root.rglob("data.json")):
+        track_dir = meta_path.parent
+        try:
+            with open(meta_path, "r", encoding="utf-8") as handle:
+                meta = json.load(handle)
+        except (OSError, json.JSONDecodeError) as error:
+            print(f"[moisesdb] skipping {track_dir}: {error}")
+            continue
+        track = HierTrack(
+            track_id=track_dir.name,
+            source=SOURCE,
+            path=track_dir,
+            split="train",
+        )
+        for stem in meta.get("stems") or []:
+            stem_name = str(stem.get("stemName", ""))
+            for item in stem.get("tracks") or []:
+                track_type = str(item.get("trackType", ""))
+                label = f"{stem_name} / {track_type}"
+                assignment = taxonomy.moisesdb_lookup(stem_name, track_type)
+                if assignment.excluded:
+                    track.excluded.append(label)
+                    continue
+                path = track_dir / stem_name / f"{item.get('id')}.{item.get('extension', 'wav')}"
+                if not path.is_file():
+                    track.missing.append(str(path))
+                    continue
+                track.files.append(
+                    SourceFile(path, assignment.parent, assignment.raw_class, label, assignment.matched)
+                )
+        if track.files:
+            tracks.append(track)
+    if not tracks:
+        raise RuntimeError(f"no MoisesDB tracks (data.json files) found under {root}")
+    classes_of = {t.track_id: {f.raw_class for f in t.files if f.raw_class is not None} for t in tracks}
+    threshold = taxonomy.min_songs if min_songs is None else int(min_songs)
+    val = stratified_val(classes_of, val_fraction, threshold, min_val, seed)
+    for track in tracks:
+        track.split = "val" if track.track_id in val else "train"
+    return tracks

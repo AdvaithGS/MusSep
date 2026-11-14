@@ -1,0 +1,150 @@
+# MusSep second-level taxonomy (CANDIDATE classes - not frozen).
+#
+# One DiT generates the sub-stems of three parents. Bass is not split.
+# This file lists *candidate* classes. Before any latent is encoded, run
+#
+#   python -m scripts.taxonomy_stats --moisesdb <root> [--slakh <root>] \
+#          --freeze configs/taxonomy.frozen.yaml
+#
+# which prints songs and minutes per class and applies the minimum-data rule
+# below: every class with fewer than `min_songs` songs is merged into its
+# `fallback` class if it names one, otherwise into its parent's `residual`.
+# A residual is never merged away. If a parent marked
+# `collapse_if_residual_rare` ends with its residual below the threshold, the
+# parent is not split at all.
+# The result (with `merges` filled in and `frozen: true`) is what
+# scripts/preprocess_latents.py and the model use. Class ids are assigned from
+# the classes that survive, in the order listed here; id 0 is the null /
+# unconditional label.
+
+version: 1
+frozen: false
+
+min_data:
+  min_songs: 20
+  # Which songs count towards the threshold. Slakh2100 is synthetic (MIDI
+  # rendered with sample libraries); by default only real multitracks count,
+  # so that a class cannot survive on synthetic data alone.
+  sources: [moisesdb]
+  split: train            # train | all
+
+merges: {}                # filled in by taxonomy_stats: {class: class it is merged into}
+collapsed_parents: []     # parents that end up with fewer than two classes (not split)
+
+parents:
+  vocals:
+    # With two classes, backing vocals is the residual: every vocal that is not
+    # the lead (choir, vocoder, beatbox, unmapped vocal labels) lands there.
+    residual: backing_vocals
+    # A lead / backing split trained on too few backing-vocal songs would mostly
+    # learn to output silence in the second slot; then vocals stays unsplit.
+    collapse_if_residual_rare: true
+    classes:
+      - lead_vocals
+      - backing_vocals    # absent in many songs -> the slot is trained to output silence
+  drums:
+    residual: drums_residual
+    classes:
+      - kick
+      - snare
+      - toms
+      # Hi-hat is listed in the MoisesDB paper's taxonomy table but not in the
+      # taxonomy of the official `moisesdb` package. Whether enough songs carry
+      # a separate hi-hat file is decided by the count; below the threshold it
+      # is folded into cymbals (not into the residual).
+      - {name: hihat, fallback: cymbals}
+      - cymbals
+      # Overheads, full-kit recordings and drum machines. Overheads and room
+      # mics contain the whole kit through bleed, so this class is large and
+      # messy by construction; that is what the residual is for.
+      - drums_residual
+  other:
+    residual: other_residual
+    classes:
+      - guitar
+      - piano
+      - keys
+      - strings
+      - wind
+      - percussion
+      - other_residual
+
+# --- MoisesDB --------------------------------------------------------------
+# data.json: stems[].stemName, stems[].tracks[].trackType.
+# Labels are compared case-insensitively with everything except letters and
+# digits removed, so "other_plucked" == "other plucked" and "hi-hat" == "hihat".
+moisesdb:
+  exclude:
+    - {stem: other, track_type: "click track"}     # metronome, not music
+  stem_to_parent:
+    vocals: vocals
+    drums: drums
+    bass: bass
+    guitar: other
+    piano: other
+    other_keys: other
+    bowed_strings: other
+    wind: other
+    percussion: other
+    other_plucked: other
+    other: other
+    "*": other
+  rules:
+    vocals:
+      track_types:
+        "lead male singer": lead_vocals
+        "lead female singer": lead_vocals
+        "background vocals": backing_vocals
+        "human choir": backing_vocals
+        "other (vocoder, beatboxing etc)": backing_vocals
+      default: backing_vocals
+    drums:
+      track_types:
+        "kick drum": kick
+        "snare drum": snare
+        "toms": toms
+        "hi-hat": hihat
+        "cymbals": cymbals
+        "overheads": drums_residual
+        "full acoustic drumkit": drums_residual
+        "drum machine": drums_residual
+      default: drums_residual
+    other:
+      stems:
+        guitar: guitar
+        piano: piano
+        other_keys: keys
+        bowed_strings: strings
+        wind: wind
+        percussion: percussion
+        other_plucked: other_residual
+        other: other_residual
+      default: other_residual
+
+# --- Slakh2100 -------------------------------------------------------------
+# metadata.yaml: stems.Sxx.{program_num, is_drum}. General MIDI program
+# numbers, 0-based, inclusive ranges. Slakh only supervises the "other"
+# parent: its drums are a single rendered stem and bass is not split.
+slakh:
+  drums_parent: drums
+  default: {class: other_residual}
+  programs:
+    - {range: [0, 5],     class: piano}           # acoustic / electric pianos
+    - {range: [6, 7],     class: keys}            # harpsichord, clavinet
+    - {range: [8, 15],    class: percussion}      # chromatic percussion
+    - {range: [16, 23],   class: keys}            # organs, accordion, harmonica
+    - {range: [24, 31],   class: guitar}
+    - {range: [32, 39],   parent: bass}
+    - {range: [40, 45],   class: strings}         # solo strings, tremolo, pizzicato
+    - {range: [46, 46],   class: other_residual}  # harp (plucked)
+    - {range: [47, 47],   class: percussion}      # timpani
+    - {range: [48, 51],   class: strings}         # ensembles
+    - {range: [52, 55],   class: keys}            # choir aahs / voice oohs / synth voice, orchestra hit
+    - {range: [56, 79],   class: wind}            # brass, reeds, pipes
+    - {range: [80, 103],  class: keys}            # synth lead, pad, fx
+    - {range: [104, 108], class: other_residual}  # sitar, banjo, shamisen, koto, kalimba
+    - {range: [109, 109], class: wind}            # bagpipe
+    - {range: [110, 110], class: strings}         # fiddle
+    - {range: [111, 111], class: wind}            # shanai
+    - {range: [112, 118], class: percussion}
+    - {range: [119, 127], class: other_residual}  # sound effects
