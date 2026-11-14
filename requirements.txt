@@ -1,15 +1,22 @@
-# Core ML & Tensor Operations (Requires PyTorch 2.0+ for native SDPA and complex tensor support)
-torch>=2.1.0
-torchaudio>=2.1.0
-
-# Pretrained Codecs & Architectures
-transformers>=4.35.0  # Required for Meta's facebook/dacvae-watermarked
-huggingface-hub>=0.19.0
-
-# Configuration & Data Handling
+# Core (Stage 1 and everything that runs on pre-encoded latents)
+torch>=2.1
+torchaudio>=2.1
+numpy>=1.24
 pyyaml>=6.0
-numpy>=1.24.0
-soundfile>=0.12.1     # Primary backend for torchaudio
+soundfile>=0.12
 
-# Optional: Accelerated Attention (if hardware compilation is supported)
-# flash-attn>=2.0.0
+# Stage 2 latent space: Meta's DAC-VAE (facebook/dacvae-watermarked).
+# Needed to pre-encode latents and to decode at inference, not to train the DiT.
+# It is its own package, not a Hugging Face `transformers` model; it pulls in
+# descript-audiotools, argbind, einops and huggingface-hub.
+dacvae @ git+https://github.com/facebookresearch/dacvae
+
+# Optional
+#   museval        BSSEval v4 SDR, the MUSDB18-HQ benchmark metric (scripts/evaluate.py --metric museval)
+#   safetensors    .safetensors community checkpoints
+#   pytest         tests
+#   rotary-embedding-torch   one test compares our RoPE with it
+museval>=0.4
+safetensors>=0.4
+pytest>=7
+rotary-embedding-torch>=0.5

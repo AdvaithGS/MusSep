@@ -1,70 +1,37 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Sets up a Python environment for MusSep and checks it.
+#
+#   ./repository_init.sh            # creates .venv, installs requirements, runs the tests
+#   ./repository_init.sh --cpu      # CPU-only PyTorch wheels (no CUDA download)
+#   ./repository_init.sh --no-vae   # skip the DAC-VAE package (Stage 1 only, or training on existing latents)
+#
+# Conda users: `conda env create -f environment.yml` instead.
+set -euo pipefail
+cd "$(dirname "$0")"
 
-# 1. Initialize Git Repository
-git init MusSep
-cd MusSep
+CPU=0; VAE=1
+for arg in "$@"; do
+  case "$arg" in
+    --cpu) CPU=1 ;;
+    --no-vae) VAE=0 ;;
+    *) echo "unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
 
-# 2. Create Directory Structure
-mkdir -p configs data models pipeline utils scripts tests checkpoints
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
 
-# 3. Create Python Module Init Files
-touch data/__init__.py
-touch models/__init__.py
-touch pipeline/__init__.py
-touch utils/__init__.py
+if [ "$CPU" = 1 ]; then
+  pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+fi
+if [ "$VAE" = 1 ]; then
+  pip install -r requirements.txt
+else
+  grep -v '^dacvae' requirements.txt > .venv/requirements.novae.txt
+  pip install -r .venv/requirements.novae.txt
+fi
 
-# 4. Create Core Files based on finalized architecture
-touch configs/roformer_base.yaml
-touch configs/dit_latent.yaml
-touch configs/distillation.yaml
-
-touch data/unified_dataset.py
-
-touch models/band_split.py
-touch models/roformer.py
-touch models/bs_roformer.py
-touch models/dac_vae.py
-touch models/dit.py
-
-touch pipeline/train_base.py
-touch pipeline/train_generative.py
-touch pipeline/train_distill.py
-touch pipeline/flow_matching.py
-touch pipeline/distillation.py
-touch pipeline/infer.py
-
-touch utils/loss.py
-touch utils/metrics.py
-touch utils/audio.py
-
-touch scripts/preprocess_latents.py
-touch scripts/separate.py
-touch scripts/evaluate.py
-
-# 5. Output established requirements
-cat <<EOT > requirements.txt
-torch>=2.1.0
-torchaudio>=2.1.0
-transformers>=4.35.0
-huggingface-hub>=0.19.0
-pyyaml>=6.0
-numpy>=1.24.0
-soundfile>=0.12.1
-EOT
-
-# 6. Create standard ignore file
-cat <<EOT > .gitignore
-__pycache__/
-*.pyc
-.DS_Store
-checkpoints/
-*.pt
-*.pth
-data/**/*.wav
-data/**/*.pt
-!data/*.py
-.env
-venv/
-EOT
-
-echo "MusSep repository structure initialized successfully."
+python -m pytest -q tests
+echo
+echo "Ready. Activate with: . .venv/bin/activate"

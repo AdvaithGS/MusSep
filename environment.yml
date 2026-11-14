@@ -1,0 +1,14 @@
+# conda env create -f environment.yml && conda activate mussep
+# Pick the PyTorch build for your CUDA version at https://pytorch.org if the default does not fit.
+name: mussep
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - libsndfile
+  - ffmpeg
+  - pip:
+      - torch>=2.1
+      - torchaudio>=2.1
+      - -r requirements.txt
