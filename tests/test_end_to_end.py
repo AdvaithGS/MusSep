@@ -172,5 +172,83 @@ def test_evaluate(stage1, stage4, musdb_root, moisesdb_root, latents, tmp_path):
     assert set(result["summary"]) == {"vocals", "drums", "avg"} and not result["full_protocol"]
     result = evaluate.main(["stage2", "--moisesdb", str(moisesdb_root), "--stage2", str(stage4), "--manifest",
                             str(latents[0]), "--max-seconds", "1", "--device", "cpu", "--out", str(tmp_path / "s2.json")])
-    assert result["sdr"] and result["distilled"]
+    assert result["oracle"]["sdr"] and result["distilled"]
     assert json.loads((tmp_path / "s2.json").read_text())["stage"] == 2
+    result = evaluate.main(["cascade", "--moisesdb", str(moisesdb_root), "--stage2", str(stage4), "--manifest",
+                            str(latents[0]), "--stage1", str(stage1[0]), "--max-seconds", "1", "--max-tracks", "2",
+                            "--device", "cpu"])
+    assert set(result["stage1"]["sdr"]) == {"vocals", "drums"}           # the stems this Stage 1 model produces
+    assert result["cascade"]["sdr"] and result["oracle"]["sdr"]
+    track = result["tracks"][0]["parents"]
+    assert set(track["drums"]) == {"oracle", "cascade"}
+    assert set(track["other"]) == {"oracle"}                             # no Stage 1 estimate of "other" here
+
+
+def test_check_vae(moisesdb_root, tmp_path):
+    from scripts import check_vae
+
+    lossless = check_vae.main(["--moisesdb", str(moisesdb_root), "--max-tracks", "1", "--max-seconds", "2",
+                               "--vae", "toy:8000:80:80", "--chunk-seconds", "0.5", "--margin-seconds", "0.1",
+                               "--device", "cpu", "--out", str(tmp_path / "v.json")])
+    assert lossless["attributes"]["frame_rate"] == 100 and lossless["attributes"]["stereo_latent_channels"] == 160
+    rows = lossless["rows"]
+    assert {r["kind"] for r in rows} == {"parent", "class"}
+    assert {r["name"] for r in rows if r["kind"] == "parent"} == {"vocals", "drums", "bass", "other"}
+    assert min(r["sdr"] for r in rows) > 60                       # an orthonormal toy codec loses nothing
+    assert max(r["chunk_latent_rel_diff"] for r in rows) < 1e-5
+    lossy = check_vae.main(["--moisesdb", str(moisesdb_root), "--max-tracks", "1", "--max-seconds", "2",
+                            "--vae", TOY_VAE, "--chunk-seconds", "0", "--device", "cpu"])
+    assert max(r["sdr"] for r in lossy["rows"]) < 30
+
+
+def test_latent_cache_gives_identical_items(latents):
+    path, _, _ = latents
+    plain = UnifiedManifestDataset(path, "val", segment_frames=40, deterministic=True, cache="none")
+    cached = UnifiedManifestDataset(path, "val", segment_frames=40, deterministic=True, cache="ram")
+    assert len(cached._cache) == len({e["latent_path"] for e in cached.entries}) and not plain._cache
+    for a, b in zip(plain[0], cached[0]):
+        torch.testing.assert_close(a, b)
+
+
+def test_preprocess_resumes_without_rereading(latents, tmp_path, moisesdb_root):
+    path, manifest, frozen = latents
+    tracks = index_moisesdb(moisesdb_root, frozen, val_fraction=0.5)[:2]
+    out = tmp_path / "again"
+    first = preprocess(tracks, frozen, build_vae(TOY_VAE), out, vae_name=TOY_VAE, verbose=False, workers=2)
+    stamp = {p: p.stat().st_mtime_ns for p in out.rglob("*.pt")}
+    second = preprocess(tracks, frozen, build_vae(TOY_VAE), out, vae_name=TOY_VAE, verbose=False, workers=0)
+    assert [e["id"] for e in first["entries"]] == [e["id"] for e in second["entries"]]
+    assert [e["classes"] for e in first["entries"]] == [e["classes"] for e in second["entries"]]
+    assert all(p.stat().st_mtime_ns == t for p, t in stamp.items())          # nothing re-encoded
+
+
+def test_training_stops_cleanly_on_signal(latents, tmp_path, monkeypatch):
+    from utils import runtime
+
+    class StopAfterThree(runtime.CheckpointClock):
+        def due(self, step):
+            if step == 3:
+                self.stop_requested = True              # as if SIGTERM had arrived during step 3
+            return super().due(step)
+
+    monkeypatch.setattr(train_generative, "CheckpointClock", StopAfterThree)
+    config = tmp_config("configs/dit_latent.yaml", tmp_path / "c.yaml", model={"tier": "debug"},
+                        data={"segment_seconds": 0.4, "num_workers": 0},
+                        training={**TRAIN, "max_steps": 1000, "save_every": 1000, "valid_every": 1000})
+    path = train_generative.train(train_generative.build_parser().parse_args(
+        ["--config", str(config), "--manifest", str(latents[0]), "--out", str(tmp_path / "run"), "--device", "cpu"]))
+    assert load_checkpoint(path)["step"] == 3
+
+
+def test_benchmark(musdb_root, latents):
+    from scripts import benchmark
+
+    one = benchmark.main(["stage1", "--tiers", "debug", "--batch-size", "1", "--steps", "1", "--warmup", "1",
+                          "--segment-seconds", "0.5", "--musdb-root", str(musdb_root), "--workers", "0", "1",
+                          "--loader-batches", "2", "--price-per-hour", "1.0", "--device", "cpu"])
+    row = one["tiers"][0]
+    assert row["batch"] == 1 and row["sec_per_step"] > 0 and row["hours"] > 0 and abs(row["cost"] - row["hours"]) < 0.1
+    assert [x["workers"] for x in one["loader"]] == [0, 1] and all(x["verdict"] for x in one["loader"])
+    two = benchmark.main(["stage2", "--tiers", "debug", "--batch-size", "2", "--steps", "1", "--warmup", "1",
+                          "--manifest", str(latents[0]), "--workers", "0", "--loader-batches", "2", "--device", "cpu"])
+    assert two["shape"]["latent_channels"] == 16 and two["tiers"][0]["examples_per_sec"] > 0

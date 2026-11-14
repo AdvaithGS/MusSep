@@ -30,6 +30,8 @@ from models.dit import build_dit
 from pipeline.flow_matching import MaskedOTFlowMatcher, drop_labels
 from pipeline.infer import STAGE2_KIND
 from utils.config import get, load_yaml, resolve_tier, tier_name
+from utils.runtime import (CheckpointClock, configure_backends, configure_threads, make_loader, maybe_compile,
+                           resolve_workers)
 from utils.training import (AmpContext, ModelEMA, RunLog, count_parameters, cycle, load_checkpoint,
                             make_optimizer, save_checkpoint, seed_everything, select_device)
 
@@ -38,21 +40,23 @@ def segment_frames(config: Dict[str, Any], manifest: Dict[str, Any]) -> int:
     return max(8, int(round(float(get(config, "data.segment_seconds", 10.0)) * float(manifest["latent_rate"]))))
 
 
-def make_loaders(config: Dict[str, Any], manifest_path: str, batch_size: int, workers: int, pin: bool
+def make_loaders(config: Dict[str, Any], manifest_path: str, batch_size: int, workers: int, device: torch.device
                  ) -> Tuple[UnifiedManifestDataset, DataLoader, Optional[DataLoader]]:
     manifest = load_manifest(manifest_path)
     data = config.get("data", {})
     frames = segment_frames(config, manifest)
     common = dict(segment_frames=frames, bleed_cond_prob=float(data.get("bleed_cond_prob", 0.5)),
                   min_active_fraction=float(data.get("min_active_fraction", 0.25)),
-                  min_class_active_fraction=float(data.get("min_class_active_fraction", 0.05)))
+                  min_class_active_fraction=float(data.get("min_class_active_fraction", 0.05)),
+                  cache=str(data.get("cache_in_memory", "auto")))
+    prefetch = int(data.get("prefetch_factor", 4))
     train_set = UnifiedManifestDataset(manifest_path, "train", full_set_prob=float(data.get("full_set_prob", 0.5)),
                                        slakh_fraction=float(data.get("slakh_fraction", 1 / 3)), **common)
-    loader = DataLoader(train_set, batch_size=batch_size, sampler=train_set.make_sampler(), num_workers=workers,
-                        drop_last=True, pin_memory=pin, persistent_workers=workers > 0)
+    loader = make_loader(train_set, batch_size, workers, device, sampler=train_set.make_sampler(), drop_last=True,
+                         prefetch_factor=prefetch)
     try:
         val_set = UnifiedManifestDataset(manifest_path, "val", deterministic=True, **common)
-        val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=workers, pin_memory=pin)
+        val_loader = make_loader(val_set, batch_size, min(workers, 2), device, prefetch_factor=prefetch)
     except RuntimeError:
         val_loader = None
     return train_set, loader, val_loader
@@ -105,8 +109,10 @@ def train(args: argparse.Namespace) -> Path:
     device = select_device(args.device)
     amp = AmpContext(device, precision=args.precision or tc.get("precision", "auto"))
     batch_size, accum = int(tc.get("batch_size", 32)), max(1, int(tc.get("grad_accum", 1)))
-    workers = int(args.workers if args.workers is not None else get(config, "data.num_workers", 4))
-    dataset, loader, val_loader = make_loaders(config, manifest_path, batch_size, workers, device.type == "cuda")
+    workers = resolve_workers(args.workers if args.workers is not None else get(config, "data.num_workers", "auto"), device)
+    threads = configure_threads(device, workers)
+    configure_backends(bool(tc.get("tf32", True)))
+    dataset, loader, val_loader = make_loaders(config, manifest_path, batch_size, workers, device)
 
     kwargs = resolve_tier(config, args.tier)
     kwargs.update(in_channels=dataset.channels, num_stem_classes=dataset.num_classes)
@@ -146,7 +152,9 @@ def train(args: argparse.Namespace) -> Path:
 
     max_steps = int(tc.get("max_steps", 300000))
     grad_clip = float(tc.get("grad_clip", 1.0))
-    log_every, valid_every, save_every = int(tc.get("log_every", 50)), int(tc.get("valid_every", 2000)), int(tc.get("save_every", 5000))
+    log_every, valid_every = int(tc.get("log_every", 50)), int(tc.get("valid_every", 2000))
+    clock = CheckpointClock(int(tc.get("save_every", 5000)), float(tc.get("save_every_minutes", 20)))
+    forward = maybe_compile(model, bool(args.compile or tc.get("compile", False)))
     batches = cycle(loader)
     model.train()
     running, seen, t0 = 0.0, 0, time.time()
@@ -155,7 +163,7 @@ def train(args: argparse.Namespace) -> Path:
             parent, stems, labels, valid = (x.to(device, non_blocking=True) for x in next(batches))
             labels = drop_labels(labels, label_dropout)
             with amp.autocast():
-                loss = loss_fn(model, stems, parent, labels, valid)
+                loss = loss_fn(forward, stems, parent, labels, valid)
             if not torch.isfinite(loss):
                 raise RuntimeError(f"non-finite loss at step {step}")
             amp.backward(loss / accum)
@@ -176,9 +184,14 @@ def train(args: argparse.Namespace) -> Path:
             if best is None or value < best["flow_loss"]:
                 best = {"step": step, "flow_loss": value}
                 save_checkpoint(out / "best.pt", stage2_payload(model, ema, kwargs, dataset, step, config, **meta, extra={"best": best}))
-        if step % save_every == 0 or step == max_steps:
+        if clock.due(step) or step == max_steps:
             save_checkpoint(out / "last.pt", stage2_payload(model, ema, kwargs, dataset, step, config, optimizer=optimizer,
                                                             scheduler=scheduler, amp=amp, **meta, extra={"best": best}))
+            clock.saved()
+        if clock.stop_requested:
+            print(f"stopped at step {step}; resume with the same command")
+            break
+    clock.close()
     print(f"done: {out / 'last.pt'}")
     return out / "last.pt"
 
@@ -195,7 +208,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float)
     parser.add_argument("--precision", choices=["auto", "bf16", "fp16", "fp32"])
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--workers", type=int)
+    parser.add_argument("--workers", help="data-loader workers, or 'auto'")
+    parser.add_argument("--compile", action="store_true", help="torch.compile the training forward pass")
     parser.add_argument("--resume")
     parser.add_argument("--fresh", action="store_true")
     return parser

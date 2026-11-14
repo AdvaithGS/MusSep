@@ -74,6 +74,12 @@ class UnifiedManifestDataset(Dataset):
         slakh_fraction: target share of Slakh examples among the examples of each
             parent Slakh supplies ("other" only), for :meth:`make_sampler`.
         deterministic: centre crop, always full set (validation).
+        cache: ``"ram"`` loads every latent file of this split into memory once, before
+            the DataLoader starts its workers; ``"none"`` reads a file per example;
+            ``"auto"`` (default) caches when the files take less than half of the
+            memory available. Rented GPU machines often keep data on network disks,
+            where thousands of small reads per minute starve the GPU. On Linux the
+            workers are forked and share the cached tensors without copying them.
     """
 
     def __init__(
@@ -90,6 +96,7 @@ class UnifiedManifestDataset(Dataset):
         max_retries: int = 8,
         slakh_fraction: float = 1.0 / 3.0,
         deterministic: bool = False,
+        cache: str = "auto",
     ):
         self.root = Path(manifest_path).parent
         self.manifest = load_manifest(manifest_path)
@@ -111,6 +118,11 @@ class UnifiedManifestDataset(Dataset):
         self.max_retries = max_retries
         self.slakh_fraction = slakh_fraction
         self.deterministic = deterministic
+        self._cache: Dict[str, Dict[str, torch.Tensor]] = {}
+        if cache not in ("auto", "ram", "none"):
+            raise ValueError("cache must be 'auto', 'ram' or 'none'")
+        if cache != "none":
+            self._fill_cache(force=cache == "ram")
 
         self.max_stems = self.taxonomy.max_slots
         self.num_classes = self.taxonomy.num_classes
@@ -118,6 +130,22 @@ class UnifiedManifestDataset(Dataset):
         self._mean = self.info["mean"][:, None]
         self._std = self.info["std"][:, None].clamp_min(1e-4)
         self._silence = (self.info["silence"][:, None] - self._mean) / self._std     # (C, 1), normalised
+
+    def _load(self, relative: str) -> Dict[str, torch.Tensor]:
+        return torch.load(self.root / relative, map_location="cpu", weights_only=True)
+
+    def _fill_cache(self, force: bool) -> None:
+        from utils.runtime import available_memory_bytes
+
+        paths = sorted({entry["latent_path"] for entry in self.entries})
+        size = sum((self.root / path).stat().st_size for path in paths)
+        free = available_memory_bytes()
+        if not force and (free is None or size > 0.5 * free):
+            print(f"[latents] not cached: {size / 1e9:.2f} GB of files"
+                  + (f", {free / 1e9:.1f} GB memory available" if free else ""))
+            return
+        self._cache = {path: self._load(path) for path in paths}
+        print(f"[latents] cached {len(paths)} files ({size / 1e9:.2f} GB) in memory")
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -170,7 +198,7 @@ class UnifiedManifestDataset(Dataset):
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         entry = self.entries[index]
-        payload = torch.load(self.root / entry["latent_path"], map_location="cpu", weights_only=True)
+        payload = self._cache.get(entry["latent_path"]) or self._load(entry["latent_path"])
         total = payload["parent"].shape[-1]
         start = self._crop_start(total, payload.get("active"))
 

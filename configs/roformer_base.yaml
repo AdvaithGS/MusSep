@@ -49,7 +49,8 @@ data:
   loudness_threshold_db: -50.0
   channel_swap_prob: 0.0
   epoch_size: 10000           # only sets the DataLoader length; sampling is unbounded
-  num_workers: 8
+  num_workers: auto           # auto: every CPU but two on a GPU machine
+  prefetch_factor: 4          # batches each worker prepares ahead
 
 loss:
   stft_window_sizes: [4096, 2048, 1024, 512, 256]
@@ -69,11 +70,14 @@ training:
   grad_clip: 1.0              # global-norm clipping; guards against loss spikes (0 = off). Not in the paper.
   ema_decay: 0.999            # paper
   ema_warmup: true            # decay = min(ema_decay, (1 + n) / (10 + n)), reaches 0.999 after ~9k steps
+  tf32: true                  # TF32 matmuls on Ampere and newer GPUs
+  compile: false              # torch.compile the training forward pass (measure with scripts/benchmark.py first)
   precision: auto             # auto (bf16 if native, else fp16 + GradScaler) | bf16 | fp16 | fp32
   seed: 0
   log_every: 50
   valid_every: 5000
   save_every: 5000
+  save_every_minutes: 20      # also save after this long; SIGTERM / Ctrl-C saves and stops cleanly
   valid_max_seconds: null     # null = whole validation tracks; a number = centred excerpt
   valid_max_tracks: null
   valid_batch_size: 4

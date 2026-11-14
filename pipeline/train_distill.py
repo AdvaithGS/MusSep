@@ -30,6 +30,7 @@ from pipeline.flow_matching import ODESolver
 from pipeline.infer import STAGE2_KIND
 from pipeline.train_generative import make_loaders, stage2_payload
 from utils.config import get, load_yaml
+from utils.runtime import CheckpointClock, configure_backends, configure_threads, resolve_workers
 from utils.training import (AmpContext, RunLog, count_parameters, cycle, load_checkpoint, make_optimizer,
                             save_checkpoint, seed_everything, select_device)
 
@@ -82,8 +83,10 @@ def train(args: argparse.Namespace) -> Path:
         student.load_state_dict(teacher.state_dict())
 
     batch_size, accum = int(tc.get("batch_size", 32)), max(1, int(tc.get("grad_accum", 1)))
-    workers = int(args.workers if args.workers is not None else get(config, "data.num_workers", 4))
-    dataset, loader, val_loader = make_loaders(config, args.manifest, batch_size, workers, device.type == "cuda")
+    workers = resolve_workers(args.workers if args.workers is not None else get(config, "data.num_workers", "auto"), device)
+    configure_threads(device, workers)
+    configure_backends(bool(tc.get("tf32", True)))
+    dataset, loader, val_loader = make_loaders(config, args.manifest, batch_size, workers, device)
     latent = teacher_state["latent"]
     for key in ("vae", "sample_rate", "hop_length", "latent_dim", "channels"):
         if latent[key] != dataset.info[key]:
@@ -118,7 +121,9 @@ def train(args: argparse.Namespace) -> Path:
 
     max_steps = int(tc.get("max_steps", 50000))
     grad_clip = float(tc.get("grad_clip", 1.0))
-    log_every, valid_every, save_every = int(tc.get("log_every", 50)), int(tc.get("valid_every", 2000)), int(tc.get("save_every", 5000))
+    log_every, valid_every = int(tc.get("log_every", 50)), int(tc.get("valid_every", 2000))
+    clock = CheckpointClock(int(tc.get("save_every", 5000)), float(tc.get("save_every_minutes", 20)))
+    distiller.compile_student(bool(args.compile or tc.get("compile", False)))
     meta = dict(distilled=True, num_steps=student_steps, cfg_scale=1.0)
     teacher_info = {"teacher": str(args.teacher), "teacher_step": teacher_state.get("step")}
     batches = cycle(loader)
@@ -147,10 +152,15 @@ def train(args: argparse.Namespace) -> Path:
             consistency, mse = evaluate(distiller, val_loader, device, amp, int(tc.get("valid_batches", 20)),
                                         distiller.num_scales, student_steps)
             log("valid", step, consistency_loss=consistency, mse_vs_teacher=mse)
-        if step % save_every == 0 or step == max_steps:
+        if clock.due(step) or step == max_steps:
             save_checkpoint(out / "last.pt", stage2_payload(
                 distiller.student, distiller.ema_student, kwargs, dataset, step, config, optimizer=optimizer,
                 scheduler=scheduler, amp=amp, **meta, extra=teacher_info))
+            clock.saved()
+        if clock.stop_requested:
+            print(f"stopped at step {step}; resume with the same command")
+            break
+    clock.close()
     print(f"done: {out / 'last.pt'} (use with --stage2; sampling defaults to {student_steps} consistency steps)")
     return out / "last.pt"
 
@@ -167,7 +177,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float)
     parser.add_argument("--precision", choices=["auto", "bf16", "fp16", "fp32"])
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--workers", type=int)
+    parser.add_argument("--workers", help="data-loader workers, or 'auto'")
+    parser.add_argument("--compile", action="store_true", help="torch.compile the student's training forward pass")
     parser.add_argument("--resume")
     parser.add_argument("--fresh", action="store_true")
     return parser

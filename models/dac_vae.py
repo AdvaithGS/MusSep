@@ -218,18 +218,20 @@ class DACVAEWrapper(nn.Module):
 
         ``sample_rate`` is the rate of ``audio`` (default: the VAE's rate).
         ``F = ceil(T_vae / hop)`` where ``T_vae`` is the length after resampling.
+        Resampling runs on the VAE's device; the result comes back on the input's.
         """
         squeeze = audio.dim() == 2
         if squeeze:
             audio = audio.unsqueeze(0)
         batch, channels, _ = audio.shape
-        audio = audio.float()
+        home = audio.device
+        audio = audio.float().to(self.device)
         if sample_rate is not None and sample_rate != self.sample_rate:
             audio = resample(audio, sample_rate, self.sample_rate)
         audio = F.pad(audio, (0, (-audio.shape[-1]) % self.hop_length))
         with torch.autocast(device_type=self.device.type, enabled=False):
             latents = self._encode_mono(audio.reshape(batch * channels, 1, -1))
-        latents = latents.reshape(batch, channels * latents.shape[1], latents.shape[-1])
+        latents = latents.reshape(batch, channels * latents.shape[1], latents.shape[-1]).to(home)
         return latents[0] if squeeze else latents
 
     @torch.no_grad()
@@ -251,13 +253,16 @@ class DACVAEWrapper(nn.Module):
         batch, width, frames = latents.shape
         if width != channels * self.latent_dim:
             raise ValueError(f"expected {channels} x {self.latent_dim} latent channels, got {width}")
+        home = latents.device
+        latents = latents.float().to(self.device)                        # decode and resample on the VAE's device
         with torch.autocast(device_type=self.device.type, enabled=False):
-            audio = self._decode_mono(latents.float().reshape(batch * channels, self.latent_dim, frames))
+            audio = self._decode_mono(latents.reshape(batch * channels, self.latent_dim, frames))
         audio = audio.reshape(batch, channels, -1)
         if sample_rate is not None and sample_rate != self.sample_rate:
             audio = resample(audio, self.sample_rate, sample_rate)
         if length is not None:
             audio = audio[..., :length] if audio.shape[-1] >= length else F.pad(audio, (0, length - audio.shape[-1]))
+        audio = audio.to(home)
         return audio[0] if squeeze else audio
 
     @torch.no_grad()

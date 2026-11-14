@@ -173,6 +173,7 @@ class Stage2Model:
     segment_frames: int
     distilled: bool = False
     num_steps: int = 50
+    cfg_scale: float = 1.0
 
 
 def load_stage2(checkpoint: str | Path, use_ema: bool = True) -> Stage2Model:
@@ -194,6 +195,7 @@ def load_stage2(checkpoint: str | Path, use_ema: bool = True) -> Stage2Model:
         segment_frames=int(payload["segment_frames"]),
         distilled=distilled,
         num_steps=int(payload.get("num_steps", 2 if distilled else 50)),
+        cfg_scale=float(payload.get("cfg_scale", 1.0)),
     )
 
 
@@ -294,7 +296,7 @@ class SubStemGenerator:
         stems: Optional[Sequence[str]] = None,
         sampler: Optional[str] = None,
         num_steps: Optional[int] = None,
-        cfg_scale: float = 1.0,
+        cfg_scale: Optional[float] = None,
         project: Optional[bool] = None,
         seed: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -323,6 +325,7 @@ class SubStemGenerator:
         generate = all_names if project else names
         sampler = sampler or ("consistency" if self.stage2.distilled else "euler")
         num_steps = num_steps or self.stage2.num_steps
+        cfg_scale = self.stage2.cfg_scale if cfg_scale is None else cfg_scale
 
         generator = None
         if seed is not None:
@@ -333,9 +336,10 @@ class SubStemGenerator:
         latents = self.generate_latents(
             latent, [taxonomy.class_id(name) for name in generate], sampler, num_steps, cfg_scale, generator=generator
         )
-        audio = self.vae.decode(latents, sample_rate, length, channels=self.channels).cpu()   # (S, C, T)
-        if project:
-            audio = ratio_mask_projection(parent_audio.float().cpu(), audio)
+        audio = self.vae.decode(latents, sample_rate, length, channels=self.channels)         # (S, C, T), on device
+        if project:   # STFT masks on the GPU too; the CPU only receives the finished stems
+            audio = ratio_mask_projection(parent_audio.float().to(audio.device), audio)
+        audio = audio.cpu()
         return {name: audio[generate.index(name)] for name in names}
 
 

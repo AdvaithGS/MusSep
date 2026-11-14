@@ -64,6 +64,7 @@ class ConsistencyFlowDistiller(nn.Module):
         for param in self.teacher.parameters():
             param.requires_grad_(False)
         self.student = student_model
+        object.__setattr__(self, "_student_fn", student_model)    # plain attribute: not a second submodule
         self.ema_student = copy.deepcopy(student_model).eval()
         for param in self.ema_student.parameters():
             param.requires_grad_(False)
@@ -78,6 +79,12 @@ class ConsistencyFlowDistiller(nn.Module):
         self.teacher.eval()
         self.ema_student.eval()
         return self
+
+    def compile_student(self, enabled: bool = True) -> None:
+        """Run the student's training forward pass through ``torch.compile``."""
+        from utils.runtime import maybe_compile
+
+        object.__setattr__(self, "_student_fn", maybe_compile(self.student, enabled))
 
     @torch.no_grad()
     def update_ema(self, decay: float = 0.999) -> None:
@@ -114,5 +121,5 @@ class ConsistencyFlowDistiller(nn.Module):
             x_next = x_now.float() + (t_next - t_now).reshape(-1, 1, 1, 1) * v_teacher
             target = self.predict_x1(self.ema_student, x_next, t_next, stem_labels, parent_latent, valid_mask)
 
-        prediction = self.predict_x1(self.student, x_now, t_now, stem_labels, parent_latent, valid_mask)
+        prediction = self.predict_x1(self._student_fn, x_now, t_now, stem_labels, parent_latent, valid_mask)
         return masked_slot_mean(pseudo_huber(prediction - target, self.huber_c), valid_mask)

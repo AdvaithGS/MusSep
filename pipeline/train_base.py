@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
 import torch
-from torch.utils.data import DataLoader
 
 from data.musdb18 import MUSDB_STEMS, MUSDBRandomMixDataset, MUSDBTrackDataset
 from models.bs_roformer import build_bs_roformer, load_community_state_dict
@@ -35,6 +34,8 @@ from pipeline.infer import STAGE1_KIND, Stage1Model, run_stage1
 from utils.config import get, load_yaml, resolve_tier, tier_name
 from utils.loss import MultiResolutionComplexSTFTLoss
 from utils.metrics import sdr
+from utils.runtime import (CheckpointClock, configure_backends, configure_threads, make_loader, maybe_compile,
+                           resolve_workers)
 from utils.training import (AmpContext, ModelEMA, RunLog, count_parameters, cycle, load_checkpoint,
                             make_optimizer, save_checkpoint, seed_everything, select_device)
 
@@ -142,24 +143,28 @@ def train(args: argparse.Namespace) -> Path:
         loudness_threshold_db=float(data_cfg.get("loudness_threshold_db", -50.0)),
         channel_swap_prob=float(data_cfg.get("channel_swap_prob", 0.0)),
     )
-    workers = int(args.workers if args.workers is not None else data_cfg.get("num_workers", 4))
+    workers = resolve_workers(args.workers if args.workers is not None else data_cfg.get("num_workers", "auto"), device)
+    threads = configure_threads(device, workers)
+    configure_backends(bool(train_cfg.get("tf32", True)))
     batch_size, accum = int(train_cfg.get("batch_size", 4)), max(1, int(train_cfg.get("grad_accum", 1)))
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=workers, drop_last=True,
-                        pin_memory=device.type == "cuda", persistent_workers=workers > 0)
+    loader = make_loader(dataset, batch_size, workers, device, shuffle=True, drop_last=True,
+                         prefetch_factor=int(data_cfg.get("prefetch_factor", 4)))
+    forward = maybe_compile(model, bool(args.compile or train_cfg.get("compile", False)))
     valid = None
     if data_cfg.get("split", "train") == "train" and int(train_cfg.get("valid_every", 0)) > 0:
         valid = MUSDBTrackDataset(root, "valid", stems, sample_rate, train_cfg.get("valid_max_seconds"), train_cfg.get("valid_max_tracks"))
 
     print(f"Stage 1 | stems {list(stems)} | tier {tier_name(config, args.tier)} | "
           f"{count_parameters(model) / 1e6:.2f}M parameters | {amp.describe()} | device {device} | "
-          f"batch {batch_size} x {accum} | {len(dataset.tracks)} training tracks")
+          f"batch {batch_size} x {accum} | {len(dataset.tracks)} training tracks | "
+          f"{workers} loader workers, {threads} main threads")
     if args.init:
         print("note: initialised from an external checkpoint; results are not MUSDB-only")
 
     max_steps = int(train_cfg.get("max_steps", 400000))
     grad_clip = float(train_cfg.get("grad_clip", 0.0))
-    log_every, valid_every, save_every = (int(train_cfg.get(k, d)) for k, d in
-                                          (("log_every", 50), ("valid_every", 5000), ("save_every", 5000)))
+    log_every, valid_every = int(train_cfg.get("log_every", 50)), int(train_cfg.get("valid_every", 5000))
+    clock = CheckpointClock(int(train_cfg.get("save_every", 5000)), float(train_cfg.get("save_every_minutes", 20)))
     batches = cycle(loader)
     model.train()
     running, seen, t0 = 0.0, 0, time.time()
@@ -168,7 +173,7 @@ def train(args: argparse.Namespace) -> Path:
             mixture, targets = next(batches)
             mixture, targets = mixture.to(device, non_blocking=True), targets.to(device, non_blocking=True)
             with amp.autocast():
-                estimate = model(mixture)
+                estimate = forward(mixture)
             loss = criterion(estimate, targets)
             if not torch.isfinite(loss):
                 raise RuntimeError(f"non-finite loss at step {step}; try --precision fp32 or a lower lr")
@@ -192,8 +197,13 @@ def train(args: argparse.Namespace) -> Path:
             if scores and (best is None or scores["avg"] > best["usdr"]):
                 best = {"step": step, "usdr": scores["avg"]}
                 save_checkpoint(out / "best.pt", payload(model, ema, optimizer, scheduler, amp, step, kwargs, stems, audio, config, best))
-        if step % save_every == 0 or step == max_steps:
+        if clock.due(step) or step == max_steps:
             save_checkpoint(out / "last.pt", payload(model, ema, optimizer, scheduler, amp, step, kwargs, stems, audio, config, best))
+            clock.saved()
+        if clock.stop_requested:
+            print(f"stopped at step {step}; resume with the same command")
+            break
+    clock.close()
     print(f"done: {out / 'last.pt'}" + (f"; best validation uSDR {best['usdr']:.2f} dB at step {best['step']}" if best else ""))
     return out / "last.pt"
 
@@ -211,7 +221,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float)
     parser.add_argument("--precision", choices=["auto", "bf16", "fp16", "fp32"])
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--workers", type=int)
+    parser.add_argument("--workers", help="data-loader workers, or 'auto'")
+    parser.add_argument("--compile", action="store_true", help="torch.compile the training forward pass")
     parser.add_argument("--init", help="initial weights (fine-tuning)")
     parser.add_argument("--resume", help="checkpoint to resume (default: <out>/last.pt if present)")
     parser.add_argument("--fresh", action="store_true", help="ignore <out>/last.pt")

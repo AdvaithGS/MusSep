@@ -125,6 +125,9 @@ The DAC-VAE comes from `pip install git+https://github.com/facebookresearch/dacv
 ## Running it
 
 ```bash
+# Before building latents: check the real VAE (attributes, reconstruction per stem, chunking, repeatability)
+python -m scripts.check_vae --moisesdb /data/moisesdb --max-tracks 5
+
 # Stage 1: one model per stem, as in the paper
 python -m pipeline.train_base --musdb-root /data/musdb18hq --stems vocals --tier base --out runs/vocals
 
@@ -144,11 +147,29 @@ python -m scripts.separate drums.wav --out separated/ --stage2 runs/stage4/last.
 # Benchmarks
 python -m scripts.evaluate stage1 --musdb-root /data/musdb18hq --stage1 runs/*/best.pt --metric museval
 python -m scripts.evaluate stage2 --moisesdb /data/moisesdb --stage2 runs/stage4/last.pt --manifest /data/latents/manifest.json
+python -m scripts.evaluate cascade --moisesdb /data/moisesdb --stage2 runs/stage4/last.pt --manifest /data/latents/manifest.json \
+    --stage1 runs/vocals/best.pt runs/drums/best.pt runs/bass/best.pt
 ```
 
 - Every training script resumes from `<out>/last.pt`, keeps `best.pt` by validation score, and logs to `<out>/log.jsonl`.
 - Model size comes from `--tier` (`debug`, `small`, `base`).
 - Precision is bf16 where the GPU supports it natively, else fp16 with a gradient scaler. STFTs, losses and the VAE always run in fp32.
+
+## Running on rented or free GPUs
+
+Every stage runs on one GPU. The code is set up for cheap, interruptible machines:
+
+- **Measure before you pay.** `python -m scripts.benchmark stage1 --tiers small base --price-per-hour 0.45` finds the largest batch that fits for each tier. It reports seconds per step, peak memory, and the hours and cost of the config's full run. With `--musdb-root` (Stage 1) or `--manifest` (Stage 2) it also times the data loader at several worker counts and says whether the CPU keeps up with the GPU. A free Kaggle or Colab session is enough to run it.
+- **Interruptions cost minutes.** Checkpoints are written every `save_every` steps and at least every `save_every_minutes` (20). SIGTERM or Ctrl-C finishes the current step, saves `last.pt` and exits. Spot instances, Colab and Kaggle send SIGTERM before they reclaim the machine. Rerunning the same command resumes.
+- **CPU balance.**
+  - Data-loader workers default to every available CPU but two (container limits respected).
+  - Each worker runs a single intra-op thread, and the main process keeps only a few, so they don't oversubscribe the cores.
+  - Batches are prefetched (`prefetch_factor`) into pinned memory.
+  - Pre-encoding loads and resamples the next songs in worker processes while the GPU encodes the current one, and skips songs whose latents already exist.
+  - Resampling in the VAE wrapper and the final projection run on the GPU.
+- **Stage 2 data in RAM.** `cache_in_memory: auto` loads every latent file into memory when they fit in half of it. Rented machines often keep data on network disks, where reading thousands of small files a minute starves the GPU.
+- **Speed switches.** TF32 is on (`tf32: true`). `torch.compile` is off by default (`compile: true` or `--compile`); measure it with the benchmark first, since it costs compile time at start-up and the gain varies.
+- **Disk.** Copy datasets to the machine's local disk before training, not a mounted network volume. Stage 1 reads random excerpts constantly.
 
 ## Benchmarks
 
@@ -165,7 +186,12 @@ python -m scripts.evaluate stage2 --moisesdb /data/moisesdb --stage2 runs/stage4
   - SDR and SI-SDR where the class is present,
   - the output level relative to the parent where it is absent (it should be silence).
 
-  It measures Stage 2 alone, not the cascade.
+  It measures Stage 2 alone.
+- **The cascade.** `evaluate.py cascade` rebuilds each held-out song's mixture, runs Stage 1, splits the *estimated* parents and scores them against the same true sub-stems. It runs the oracle on the same excerpts too, so the "cascade − oracle" column is the cost of Stage 1's errors. That is the number a user gets. Stage 1's SDR on these MoisesDB songs is reported alongside, as a cross-dataset figure, not a benchmark.
+
+## Checking Stage 1 against the reference implementation
+
+`scripts/compare_reference.py` builds lucidrains' published `BS-RoFormer` package and our model with the same configuration, compares weight names and shapes, and, if they match, the outputs with identical weights. It is not part of the test suite and has not been run here; install the release closest to the checkpoints you plan to load (`pip install BS-RoFormer==0.4.1`, for example) and run `python -m scripts.compare_reference`.
 
 ## Tests
 
@@ -173,7 +199,7 @@ python -m scripts.evaluate stage2 --moisesdb /data/moisesdb --stage2 runs/stage4
 pytest -q tests
 ```
 
-48 tests run on CPU in under a minute, on synthetic data laid out like the real datasets, with tiny models and a toy linear VAE. They cover:
+60 tests run on CPU in about a minute and a half, on synthetic data laid out like the real datasets, with tiny models and a toy linear VAE. They cover:
 - shapes and the community state-dict layout,
 - RoPE against the reference package,
 - the paper-size parameter count,

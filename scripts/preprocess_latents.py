@@ -102,6 +102,50 @@ def _load_classes(
     }
 
 
+def _single(job: Dict[str, Any]) -> Dict[str, Any]:
+    return job
+
+
+class _SongJobs(torch.utils.data.Dataset):
+    """One item per (song, parent): the CPU half of pre-encoding.
+
+    Data-loader workers decode, resample and sum the audio of the next songs
+    while the main process runs the VAE on the GPU. Songs whose latent files
+    already exist are not read at all (resuming an interrupted run).
+    """
+
+    def __init__(self, tracks, taxonomy, out_dir, sample_rate, channels, presence_db, hop, min_present_seconds,
+                 num_aug, bleed, overwrite):
+        self.jobs = [(i, parent) for i in range(len(tracks)) for parent in taxonomy.parents]
+        self.tracks, self.taxonomy, self.out_dir = tracks, taxonomy, Path(out_dir)
+        self.args = (sample_rate, channels, presence_db, hop, min_present_seconds)
+        self.num_aug, self.bleed, self.overwrite = num_aug, bleed, overwrite
+
+    def __len__(self) -> int:
+        return len(self.jobs)
+
+    def paths(self, index: int, parent: str) -> List[Path]:
+        track = self.tracks[index]
+        count = 1 + (self.num_aug if track.split == "train" else 0)
+        return [Path("latents") / track.source / f"{track.track_id}__{parent}__aug{aug}.pt" for aug in range(count)]
+
+    def __getitem__(self, item: int) -> Dict[str, Any]:
+        index, parent = self.jobs[item]
+        track = self.tracks[index]
+        job: Dict[str, Any] = {"index": index, "parent": parent, "names": [], "stems": None, "bleed": None}
+        if not self.overwrite and all((self.out_dir / p).is_file() for p in self.paths(index, parent)):
+            job["cached"] = True
+            return job
+        sample_rate, channels, presence_db, hop, min_present = self.args
+        classes = _load_classes(track, parent, self.taxonomy, sample_rate, channels, presence_db, hop, min_present)
+        if classes:
+            job["names"] = list(classes)
+            job["stems"] = torch.stack(list(classes.values()))
+            if self.bleed and track.other_parent_files(parent):
+                job["bleed"] = load_and_sum(track.other_parent_files(parent), sample_rate, channels, job["stems"].shape[-1])
+        return job
+
+
 def preprocess(
     tracks: Sequence[HierTrack],
     taxonomy: Taxonomy,
@@ -118,12 +162,16 @@ def preprocess(
     seed: int = 0,
     overwrite: bool = False,
     verbose: bool = True,
+    workers: Any = "auto",
 ) -> Dict[str, Any]:
     """Encodes ``tracks`` and writes ``<out_dir>/manifest.json``. Returns the manifest.
 
     ``num_aug`` extra versions of every *training* song are encoded with an
     independent random gain per class (gain is not linear in latent space,
     so it has to be applied before encoding).
+
+    Audio loading runs in ``workers`` background processes (``"auto"``: up to 4,
+    each holding one song's stems at a time) so the VAE never waits for the disk.
     """
     out_dir = Path(out_dir)
     sample_rate, hop = vae.sample_rate, vae.hop_length
@@ -131,64 +179,71 @@ def preprocess(
     entries: List[Dict[str, Any]] = []
     written_bytes, written_seconds = 0, 0.0
 
-    for index, track in enumerate(tracks):
-        for parent in taxonomy.parents:
-            classes = _load_classes(track, parent, taxonomy, sample_rate, channels, presence_db, hop, min_present_seconds)
-            if not classes:
-                continue
-            names = list(classes)
-            class_ids = torch.tensor([taxonomy.class_id(name) for name in names], dtype=torch.long)
-            bleed = None
-            if bleed_range_db is not None and track.other_parent_files(parent):
-                length = next(iter(classes.values())).shape[-1]
-                bleed = load_and_sum(track.other_parent_files(parent), sample_rate, channels, length)
+    from utils.runtime import make_loader, resolve_workers
 
-            for aug in range(1 + (num_aug if track.split == "train" else 0)):
-                relative = Path("latents") / track.source / f"{track.track_id}__{parent}__aug{aug}.pt"
-                path = out_dir / relative
-                if path.is_file() and not overwrite:
-                    payload = torch.load(path, map_location="cpu", weights_only=True)
-                else:
-                    rng = random.Random(f"{seed}:{track.source}:{track.track_id}:{parent}:{aug}")
-                    stems = [
-                        classes[name] if aug == 0 else apply_gain(classes[name], rng.uniform(*gain_range_db))
-                        for name in names
-                    ]
-                    parent_audio = torch.stack(stems).sum(dim=0)
-                    parent_latent = vae.encode(parent_audio)
-                    payload = {
-                        "parent": parent_latent.half(),
-                        "stems": torch.stack([vae.encode(stem) for stem in stems]).half(),
-                        "class_ids": class_ids,
-                        "active": frame_activity(parent_audio, hop, parent_latent.shape[-1], presence_db),
-                        "class_active": torch.stack([frame_activity(stem, hop, parent_latent.shape[-1], presence_db)
-                                                     for stem in stems]),
-                    }
-                    if bleed is not None:
-                        cond_audio = parent_audio + apply_gain(bleed, rng.uniform(*bleed_range_db))
-                        payload["cond"] = vae.encode(cond_audio).half()
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    torch.save(payload, path)
-                    written_bytes += path.stat().st_size
-                    written_seconds += parent_latent.shape[-1] * hop / sample_rate
-
-                if track.split == "train" and aug == 0:
-                    stats.update(payload["stems"].float())
-                    stats.update(payload["parent"].float())
-                entries.append({
-                    "id": f"{track.source}/{track.track_id}/{parent}/aug{aug}",
-                    "track_id": track.track_id,
-                    "source": track.source,
-                    "split": track.split,
-                    "parent": parent,
-                    "aug": aug,
-                    "latent_path": relative.as_posix(),
-                    "num_frames": int(payload["parent"].shape[-1]),
-                    "classes": names,
-                })
-        if verbose and (index + 1) % 10 == 0:
+    jobs = _SongJobs(tracks, taxonomy, out_dir, sample_rate, channels, presence_db, hop, min_present_seconds,
+                     num_aug, bleed_range_db is not None, overwrite)
+    count = resolve_workers(workers, torch.device("cuda") if vae.device.type == "cuda" else vae.device, cap=4)
+    loader = make_loader(jobs, None, count, torch.device("cpu"), prefetch_factor=1, persistent=False,
+                         collate_fn=_single)
+    for job in loader:
+        track, parent = tracks[job["index"]], job["parent"]
+        if verbose and parent == taxonomy.parents[0] and job["index"] and job["index"] % 10 == 0:
             rate = f", {written_bytes / max(written_seconds, 1e-9) * 3600 / 1e9:.2f} GB per encoded hour" if written_seconds else ""
-            print(f"[preprocess] {index + 1}/{len(tracks)} songs, {len(entries)} entries{rate}", flush=True)
+            print(f"[preprocess] {job['index']}/{len(tracks)} songs, {len(entries)} entries{rate}", flush=True)
+        if job.get("cached"):
+            relatives = jobs.paths(job["index"], parent)
+            first = torch.load(out_dir / relatives[0], map_location="cpu", weights_only=True)
+            names = [taxonomy.class_names[int(i)] for i in first["class_ids"]]
+        else:
+            if not job["names"]:
+                continue
+            names = job["names"]
+        class_ids = torch.tensor([taxonomy.class_id(name) for name in names], dtype=torch.long)
+        classes = dict(zip(names, job["stems"])) if job["stems"] is not None else {}
+        bleed = job["bleed"]
+        for aug, relative in enumerate(jobs.paths(job["index"], parent)):
+            path = out_dir / relative
+            if path.is_file() and not overwrite:
+                payload = torch.load(path, map_location="cpu", weights_only=True)
+            else:
+                rng = random.Random(f"{seed}:{track.source}:{track.track_id}:{parent}:{aug}")
+                stems = [
+                    classes[name] if aug == 0 else apply_gain(classes[name], rng.uniform(*gain_range_db))
+                    for name in names
+                ]
+                parent_audio = torch.stack(stems).sum(dim=0)
+                parent_latent = vae.encode(parent_audio)
+                payload = {
+                    "parent": parent_latent.half(),
+                    "stems": torch.stack([vae.encode(stem) for stem in stems]).half(),
+                    "class_ids": class_ids,
+                    "active": frame_activity(parent_audio, hop, parent_latent.shape[-1], presence_db),
+                    "class_active": torch.stack([frame_activity(stem, hop, parent_latent.shape[-1], presence_db)
+                                                 for stem in stems]),
+                }
+                if bleed is not None:
+                    cond_audio = parent_audio + apply_gain(bleed, rng.uniform(*bleed_range_db))
+                    payload["cond"] = vae.encode(cond_audio).half()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(payload, path)
+                written_bytes += path.stat().st_size
+                written_seconds += parent_latent.shape[-1] * hop / sample_rate
+
+            if track.split == "train" and aug == 0:
+                stats.update(payload["stems"].float())
+                stats.update(payload["parent"].float())
+            entries.append({
+                "id": f"{track.source}/{track.track_id}/{parent}/aug{aug}",
+                "track_id": track.track_id,
+                "source": track.source,
+                "split": track.split,
+                "parent": parent,
+                "aug": aug,
+                "latent_path": relative.as_posix(),
+                "num_frames": int(payload["parent"].shape[-1]),
+                "classes": names,
+            })
 
     mean, std = stats.result()
     manifest = {
@@ -243,6 +298,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--min-songs", type=int, help="override the taxonomy's min_data.min_songs")
     parser.add_argument("--no-min-data-rule", action="store_true",
                         help="use the taxonomy as given even if it is not frozen")
+    parser.add_argument("--workers", default="auto", help="audio-loading processes (default: up to 4)")
     parser.add_argument("--dry-run", action="store_true", help="print the class counts and stop")
     args = parser.parse_args(argv)
 
@@ -276,7 +332,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     preprocess(
         tracks, taxonomy, vae, out_dir, vae_name=args.vae, num_aug=args.num_aug,
         gain_range_db=tuple(args.gain_db), bleed_range_db=tuple(args.bleed_db) if args.bleed_db else None,
-        presence_db=args.presence_db, min_present_seconds=args.min_present_seconds, seed=args.seed,
+        presence_db=args.presence_db, min_present_seconds=args.min_present_seconds, seed=args.seed, workers=args.workers,
         overwrite=args.overwrite, split_info={"moisesdb": "stratified", "val_fraction": args.val_fraction,
                                               "seed": args.split_seed, "min_val_songs": args.min_val_songs},
     )
