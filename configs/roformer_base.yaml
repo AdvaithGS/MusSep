@@ -1,19 +1,79 @@
+# Stage 1: BS-RoFormer on MUSDB18-HQ (pipeline/train_base.py).
+#
+# Module layout and state-dict keys follow the community implementation
+# (lucidrains / ZFTurbo), so public checkpoints load with
+# models.bs_roformer.load_community_state_dict. Note that almost all public
+# checkpoints were trained with data beyond MUSDB18-HQ; numbers obtained with
+# them are not comparable with the paper's MUSDB-only results.
+
 model:
   type: bs_roformer
-  channels: 2
-  hidden_dim: 128
-  num_heads: 8
-  depth: 12
-  # Leave bands undefined to default to the paper's 62-band scheme
+  tier: small                 # debug | small | base | large | viperx
+  stereo: true
+  time_transformer_depth: 1
+  freq_transformer_depth: 1
+  stft_n_fft: 2048
+  stft_hop_length: 441        # 10 ms at 44.1 kHz, as in the paper
+  stft_win_length: 2048
+  zero_dc: true
+  mask_estimator_depth: 2
+  mlp_expansion_factor: 4
+  attn_dropout: 0.0
+  ff_dropout: 0.0
+  flash_attn: true
+  skip_connection: false
+  use_torch_checkpoint: false # gradient checkpointing: less memory, ~30% slower
+  mask_init_std: null         # e.g. 1.0e-3 for a near-zero initial mask (from scratch only)
+  # freqs_per_bands: default 62-band split of models/band_split.py
+
+tiers:
+  debug: {dim: 64, depth: 2, heads: 4, dim_head: 16}        # CPU smoke tests
+  small: {dim: 192, depth: 6, heads: 8, dim_head: 24}       # one consumer GPU
+  base:  {dim: 384, depth: 6, heads: 8, dim_head: 48}       # paper size, ~72M parameters (stereo, one stem)
+  large: {dim: 384, depth: 12, heads: 8, dim_head: 48}      # 12 layer pairs
+  # Layout of the widely shared "viperx" vocals checkpoint. Its published
+  # numbers are not MUSDB-only.
+  viperx: {dim: 512, depth: 12, heads: 8, dim_head: 64, attn_dropout: 0.1, ff_dropout: 0.1}
 
 audio:
   sample_rate: 44100
-  n_fft: 2048
-  hop_length: 512
+  segment_seconds: 8.0        # paper: 8 s training excerpts
+  inference_overlap: 0.5      # 8 s chunks, 4 s hop, overlap-average (paper protocol)
+
+data:
+  musdb_root: null            # or pass --musdb-root
+  split: train                # train (86 tracks, 14 held out) | train_full (all 100)
+  random_mix: true            # each stem from an independent song and offset
+  gain_db: [-3.0, 3.0]
+  silence_prob: 0.1
+  loudness_threshold_db: -50.0
+  channel_swap_prob: 0.0
+  epoch_size: 10000           # only sets the DataLoader length; sampling is unbounded
+  num_workers: 8
+
+loss:
+  stft_window_sizes: [4096, 2048, 1024, 512, 256]
+  stft_hop_length: 147
+  stft_weight: 1.0
 
 training:
-  batch_size: 4
-  learning_rate: 1e-4
-  mixed_precision: true  # Essential for SDPA / FlashAttention efficiency
-  epochs: 100
-  target_stem: vocals    # E.g., train one model per stem, or "multi" if using a shared base
+  target_stems: [vocals]      # paper: one model per stem; any subset of vocals, bass, drums, other
+  batch_size: 4               # per optimizer step after accumulation: batch_size x grad_accum
+  grad_accum: 1               # paper: 128 per step on 16 GPUs
+  max_steps: 400000           # a budget, not a value from the paper
+  lr: 5.0e-4                  # paper
+  lr_decay: 0.9               # paper: x0.9 ...
+  lr_decay_every: 40000       # ... every 40k steps
+  warmup_steps: 0
+  weight_decay: 0.0
+  grad_clip: 1.0              # global-norm clipping; guards against loss spikes (0 = off). Not in the paper.
+  ema_decay: 0.999            # paper
+  ema_warmup: true            # decay = min(ema_decay, (1 + n) / (10 + n)), reaches 0.999 after ~9k steps
+  precision: auto             # auto (bf16 if native, else fp16 + GradScaler) | bf16 | fp16 | fp32
+  seed: 0
+  log_every: 50
+  valid_every: 5000
+  save_every: 5000
+  valid_max_seconds: null     # null = whole validation tracks; a number = centred excerpt
+  valid_max_tracks: null
+  valid_batch_size: 4
