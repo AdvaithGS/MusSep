@@ -1,0 +1,55 @@
+# Stage 2: joint sub-stem DiT with masked OT flow matching on pre-encoded
+# DAC-VAE latents (pipeline/train_generative.py).
+#
+# Latent width, frame rate and the class vocabulary are read from the latent
+# manifest written by scripts/preprocess_latents.py, never from this file.
+
+model:
+  type: joint_substem_dit
+  tier: small                 # debug | small | base
+  ff_mult: 4
+  dropout: 0.0
+  use_checkpoint: false
+
+tiers:
+  debug: {hidden_dim: 256, num_heads: 4, depth: 4}
+  small: {hidden_dim: 384, num_heads: 6, depth: 12}
+  base:  {hidden_dim: 512, num_heads: 8, depth: 12}
+
+data:
+  manifest: null              # or pass --manifest
+  segment_seconds: 10.0       # converted to latent frames with the manifest's frame rate
+  full_set_prob: 0.5          # "hybrid": all classes (silence for absent) vs present classes only
+  bleed_cond_prob: 0.5        # use the stored parent+bleed conditioning when it exists
+  min_active_fraction: 0.25   # re-draw crops in which the parent is mostly silent
+  min_class_active_fraction: 0.05  # a class is "present" in a crop if active in >= 5% of its frames
+  slakh_fraction: 0.333       # Slakh2100's share of the "other" examples (it supplies no vocals or drums)
+  num_workers: 6
+
+flow:
+  sigma_min: 1.0e-5
+  time_sampling: uniform      # uniform | logit_normal
+  logit_mean: 0.0
+  logit_std: 1.0
+  label_dropout: 0.1          # classifier-free guidance: per example, all labels -> null
+
+training:
+  batch_size: 32
+  grad_accum: 1
+  max_steps: 300000           # a budget
+  lr: 1.0e-4
+  warmup_steps: 5000
+  weight_decay: 0.01
+  grad_clip: 1.0
+  ema_decay: 0.9999           # reached after ~90k steps when ema_warmup is on
+  ema_warmup: true            # decay = min(ema_decay, (1 + n) / (10 + n)): short runs are not dominated by init
+  precision: auto
+  seed: 0
+  log_every: 50
+  valid_every: 2000
+  save_every: 5000
+  valid_batches: 20
+
+sampling:                     # defaults stored in the checkpoint for inference
+  num_steps: 50               # Euler steps
+  cfg_scale: 1.0              # 1.0 = plain conditional model

@@ -1,91 +1,118 @@
+"""Consistency distillation of the flow-matching teacher (Stage 4).
+
+The student keeps the teacher's velocity parameterisation; its data estimate
+``f(x_t, t) = x_t + (1 - t) v(x_t, t)`` satisfies the boundary condition
+``f(x_1, 1) = x_1`` by construction. Training enforces self-consistency along
+the teacher's probability-flow ODE, discretised into ``num_scales`` steps:
+
+    t_n = n / N,   n ~ U{0, ..., N-1}
+    x_{t_n}      on the OT path between noise and data
+    x_{t_{n+1}}  = x_{t_n} + (t_{n+1} - t_n) * v_teacher(x_{t_n}, t_n)     (one Euler step)
+    loss         = PseudoHuber( f_student(x_{t_n}, t_n) - f_ema(x_{t_{n+1}}, t_{n+1}) )
+
+with the Pseudo-Huber metric ``sqrt(||d||^2 + c^2) - c`` computed per stem
+slot in latent space and averaged over valid slots.
+"""
+from __future__ import annotations
+
+import copy
+import math
+from typing import Optional
+
 import torch
 import torch.nn as nn
-import copy
+
+from .flow_matching import ODESolver, masked_slot_mean, predict_x1
+
+
+def pseudo_huber(difference: torch.Tensor, c: Optional[float] = None) -> torch.Tensor:
+    """Pseudo-Huber distance per slot: ``(B, S, C, T) -> (B, S)``.
+
+    ``c`` defaults to ``0.00054 * sqrt(C * T)`` (Song & Dhariwal, "Improved
+    Techniques for Training Consistency Models").
+    """
+    difference = difference.float()
+    if c is None:
+        c = 0.00054 * math.sqrt(difference.shape[2] * difference.shape[3])
+    return torch.sqrt(difference.pow(2).sum(dim=(2, 3)) + c * c) - c
+
 
 class ConsistencyFlowDistiller(nn.Module):
     """
-    Distills a pretrained Flow-Matching Teacher into a Consistency Student.
+    Args:
+        teacher_model: trained flow-matching DiT (frozen here).
+        student_model: trainable DiT, normally initialised from the teacher.
+        num_scales: discretisation ``N`` of the teacher trajectory.
+        teacher_cfg_scale: classifier-free-guidance scale baked into the
+            teacher's step. With a value other than 1 the student reproduces
+            guided sampling without needing guidance itself.
+        huber_c: Pseudo-Huber constant (``None`` = automatic).
     """
-    def __init__(self, teacher_model, student_model, num_scales=50):
+
+    def __init__(
+        self,
+        teacher_model: nn.Module,
+        student_model: nn.Module,
+        num_scales: int = 50,
+        sigma_min: float = 1e-5,
+        teacher_cfg_scale: float = 1.0,
+        huber_c: Optional[float] = None,
+        null_label: int = 0,
+    ):
         super().__init__()
-        self.teacher = teacher_model
-        self.teacher.eval()
-        for p in self.teacher.parameters():
-            p.requires_grad = False
-            
+        self.teacher = teacher_model.eval()
+        for param in self.teacher.parameters():
+            param.requires_grad_(False)
         self.student = student_model
-        
-        # EMA Student for stable target generation
-        self.ema_student = copy.deepcopy(student_model)
+        self.ema_student = copy.deepcopy(student_model).eval()
+        for param in self.ema_student.parameters():
+            param.requires_grad_(False)
+        self.num_scales = int(num_scales)
+        self.sigma_min = sigma_min
+        self.teacher_cfg_scale = teacher_cfg_scale
+        self.huber_c = huber_c
+        self.null_label = null_label
+
+    def train(self, mode: bool = True) -> "ConsistencyFlowDistiller":
+        super().train(mode)
+        self.teacher.eval()
         self.ema_student.eval()
-        for p in self.ema_student.parameters():
-            p.requires_grad = False
-            
-        self.num_scales = num_scales
+        return self
 
     @torch.no_grad()
-    def update_ema(self, decay=0.999):
-        for ema_param, student_param in zip(self.ema_student.parameters(), self.student.parameters()):
-            ema_param.data.mul_(decay).add_(student_param.data, alpha=1 - decay)
+    def update_ema(self, decay: float = 0.999) -> None:
+        for ema_param, param in zip(self.ema_student.parameters(), self.student.parameters()):
+            ema_param.mul_(decay).add_(param.detach(), alpha=1.0 - decay)
+        for ema_buffer, buffer in zip(self.ema_student.buffers(), self.student.buffers()):
+            ema_buffer.copy_(buffer)
 
-    def student_target_prediction(self, model, x_t, t, stem_labels, parent_latent):
-        """
-        Reparameterizes the velocity model to predict x_1 directly.
-        Since x_t = (1-t)x_0 + t x_1  ->  v_t = x_1 - x_0
-        x_1 = x_t + (1-t) * v_t
-        """
-        v_pred = model(x_t, t, stem_labels, parent_latent)
-        
-        # t_expanded for broadcasting to (B, S, C, T_seq)
-        t_exp = t.view(-1, 1, 1, 1)
-        x1_pred = x_t + (1.0 - t_exp) * v_pred
-        return x1_pred
+    @staticmethod
+    def predict_x1(model, x_t, t, stem_labels, parent_latent, valid_mask=None) -> torch.Tensor:
+        return predict_x1(x_t, t, model(x_t, t, stem_labels, parent_latent, valid_mask).float())
 
-    def forward(self, x1, parent_latent, stem_labels, valid_mask):
-        """
-        x1: Target latents (Batch, Num_Stems, Channels, Time)
-        """
-        B = x1.shape[0]
-        device = x1.device
-        
-        # 1. Sample noise
+    def forward(
+        self,
+        x1: torch.Tensor,
+        parent_latent: torch.Tensor,
+        stem_labels: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        batch = x1.shape[0]
         x0 = torch.randn_like(x1)
-        
-        # 2. Sample discrete timesteps for distillation
-        indices = torch.randint(0, self.num_scales - 1, (B,), device=device)
-        
-        # t_{n+1} (further from data) and t_n (closer to data)
-        # Note: In OT-CFM, t=1 is data, t=0 is noise.
-        t_n1 = indices / self.num_scales
-        t_n = (indices + 1) / self.num_scales
-        
-        t_n1_exp = t_n1.view(-1, 1, 1, 1)
-        
-        # 3. Get x at t_{n+1}
-        x_n1 = (1.0 - t_n1_exp) * x0 + t_n1_exp * x1
-        
+        index = torch.randint(0, self.num_scales, (batch,), device=x1.device)
+        t_now = index.float() / self.num_scales
+        t_next = (index + 1).float() / self.num_scales
+
+        t_b = t_now.reshape(-1, 1, 1, 1).to(x1.dtype)
+        x_now = (1.0 - (1.0 - self.sigma_min) * t_b) * x0 + t_b * x1
+
         with torch.no_grad():
-            # 4. Teacher Euler step from t_{n+1} to t_n
-            v_teacher = self.teacher(x_n1, t_n1, stem_labels, parent_latent)
-            dt = (t_n - t_n1).view(-1, 1, 1, 1)
-            x_n = x_n1 + v_teacher * dt
-            
-            # 5. EMA Student prediction at t_n (Target)
-            target_x1 = self.student_target_prediction(
-                self.ema_student, x_n, t_n, stem_labels, parent_latent
+            v_teacher = ODESolver.velocity(
+                self.teacher, x_now, t_now, stem_labels, parent_latent, valid_mask,
+                self.teacher_cfg_scale, self.null_label,
             )
-            
-        # 6. Student prediction at t_{n+1}
-        pred_x1 = self.student_target_prediction(
-            self.student, x_n1, t_n1, stem_labels, parent_latent
-        )
-        
-        # 7. Consistency Loss (L2 distance between the two predictions)
-        loss = (pred_x1 - target_x1) ** 2
-        loss = loss.mean(dim=[2, 3])
-        
-        # Mask valid stems
-        masked_loss = loss * valid_mask.float()
-        num_valid = valid_mask.float().sum()
-        
-        return masked_loss.sum() / num_valid if num_valid > 0 else torch.tensor(0.0, requires_grad=True)
+            x_next = x_now.float() + (t_next - t_now).reshape(-1, 1, 1, 1) * v_teacher
+            target = self.predict_x1(self.ema_student, x_next, t_next, stem_labels, parent_latent, valid_mask)
+
+        prediction = self.predict_x1(self.student, x_now, t_now, stem_labels, parent_latent, valid_mask)
+        return masked_slot_mean(pseudo_huber(prediction - target, self.huber_c), valid_mask)
