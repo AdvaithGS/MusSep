@@ -120,3 +120,74 @@ def test_community_yaml_with_python_tuple(tmp_path):
         "  freqs_per_bands: !!python/tuple\n" + "".join(f"  - {w}\n" for w in DEFAULT_FREQS_PER_BANDS))
     model = build_bs_roformer(load_yaml(tmp_path / "c.yaml")["model"])
     assert model.freqs_per_bands == tuple(DEFAULT_FREQS_PER_BANDS)
+
+
+ZFTURBO_STYLE_YAML = """\
+audio:
+  chunk_size: 88200
+  dim_f: 1024
+  hop_length: 441
+  n_fft: 2048
+  num_channels: 2
+  sample_rate: 44100
+model:
+  dim: 32
+  depth: 1
+  stereo: true
+  num_stems: 1
+  time_transformer_depth: 1
+  freq_transformer_depth: 1
+  linear_transformer_depth: 0
+  freqs_per_bands: !!python/tuple
+FREQS  dim_head: 8
+  heads: 2
+  attn_dropout: 0.1
+  ff_dropout: 0.1
+  flash_attn: true
+  dim_freqs_in: 1025
+  stft_n_fft: 2048
+  stft_hop_length: 441
+  stft_win_length: 2048
+  stft_normalized: false
+  mask_estimator_depth: 2
+  multi_stft_resolution_loss_weight: 1.0
+  multi_stft_resolutions_window_sizes: !!python/tuple
+  - 4096
+  - 2048
+  multi_stft_hop_size: 147
+  multi_stft_normalized: false
+  sage_attention: false
+training:
+  batch_size: 2
+  instruments:
+  - vocals
+  - other
+  target_instrument: vocals
+inference:
+  batch_size: 1
+  num_overlap: 2
+"""
+
+
+def test_community_checkpoint_with_its_training_yaml(tmp_path):
+    from pipeline.infer import load_stage1, run_stage1
+
+    text = ZFTURBO_STYLE_YAML.replace("FREQS", "".join(f"  - {w}\n" for w in DEFAULT_FREQS_PER_BANDS))
+    (tmp_path / "config.yaml").write_text(text)
+    with pytest.warns(UserWarning, match="sage_attention"):
+        source = build_bs_roformer(load_yaml(tmp_path / "config.yaml")["model"])
+    torch.save({"state_dict": source.state_dict()}, tmp_path / "model.ckpt")
+    with pytest.warns(UserWarning):
+        entry = load_stage1(tmp_path / "model.ckpt", tmp_path / "config.yaml")
+    assert entry.stems == ["vocals"] and entry.chunk_size == 88200 and entry.sample_rate == 44100
+    out = run_stage1(entry, torch.randn(2, 100_000), torch.device("cpu"))
+    assert set(out) == {"vocals"} and out["vocals"].shape == (2, 100_000)
+
+
+def test_safetensors_checkpoint(tmp_path):
+    safetensors = pytest.importorskip("safetensors.torch")
+    a, b = BSRoformer(**TINY), BSRoformer(**TINY)
+    safetensors.save_file(a.state_dict(), str(tmp_path / "m.safetensors"))
+    load_community_state_dict(b, tmp_path / "m.safetensors")
+    x = torch.randn(1, 2, 8820)
+    torch.testing.assert_close(a(x), b(x))

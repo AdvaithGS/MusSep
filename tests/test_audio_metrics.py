@@ -49,3 +49,19 @@ def test_loss_is_zero_for_identical_and_positive_otherwise():
     assert float(loss(x, x)) == 0.0
     total, parts = loss(x, x + 0.1, return_breakdown=True)
     assert float(total) > 0 and set(parts) >= {"wave", "stft"}
+
+
+def test_museval_wrapper():
+    """BSSEval v4 through museval: the metric behind published MUSDB18-HQ tables."""
+    import pytest
+
+    pytest.importorskip("museval")
+    from utils.metrics import museval_sdr
+
+    torch.manual_seed(0)
+    refs = {"vocals": torch.randn(2, 3 * 44100) * 0.1, "drums": torch.randn(2, 3 * 44100) * 0.1}
+    good = {k: v + 0.01 * torch.randn_like(v) for k, v in refs.items()}
+    bad = {k: v + 0.1 * torch.randn_like(v) for k, v in refs.items()}
+    hi, lo = museval_sdr(refs, good), museval_sdr(refs, bad)
+    assert set(hi) == {"vocals", "drums"}
+    assert all(hi[k] > lo[k] + 10 for k in hi)          # 20 dB less noise -> clearly higher SDR

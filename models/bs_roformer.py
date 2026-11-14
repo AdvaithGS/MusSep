@@ -19,6 +19,7 @@ Differences that do not affect the weights:
 """
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -92,10 +93,14 @@ class BSRoformer(nn.Module):
                 "linear_transformer_depth > 0 is not supported by this implementation "
                 "(none of the commonly distributed BS-RoFormer checkpoints use it)"
             )
+        # Community configs carry switches this implementation does not have (attention
+        # backends, experimental options). They are ignored with a warning: a switch that
+        # changes the architecture shows up as missing or mismatched weights when the
+        # checkpoint is loaded strictly, so it cannot pass silently.
         ignorable = {"sample_rate", "use_pope", "use_shared_bias"}
         unknown = sorted(set(unused) - ignorable)
         if unknown:
-            raise TypeError(f"BSRoformer got unexpected keyword arguments: {unknown}")
+            warnings.warn(f"BSRoformer ignores unsupported config keys: {unknown}", stacklevel=2)
 
         self.stereo = stereo
         self.audio_channels = 2 if stereo else 1

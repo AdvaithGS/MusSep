@@ -105,7 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-is", help="the input already is this parent stem; skip Stage 1")
     parser.add_argument("--sampler", choices=["euler", "consistency"], help="default: from the checkpoint")
     parser.add_argument("--steps", type=int, help="sampling steps (default: from the checkpoint)")
-    parser.add_argument("--cfg-scale", type=float, default=1.0, help="classifier-free guidance (Euler sampler)")
+    parser.add_argument("--cfg-scale", type=float, help="classifier-free guidance, Euler sampler (default: the checkpoint's)")
     parser.add_argument("--no-project", action="store_true",
                         help="return the decoded sub-stems instead of masks on the parent's spectrogram "
                              "(with --stems, only those slots are generated: faster, but outputs do not sum to the parent)")
