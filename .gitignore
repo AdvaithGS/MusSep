@@ -192,3 +192,15 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# MusSep: training runs, checkpoints, pre-encoded latents, audio
+runs/
+checkpoints/
+results/
+separated/
+latents/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.wav
+*.flac
