@@ -1,4 +1,4 @@
-"""Runtime settings for cheap and interruptible GPU machines.
+"""Runtime settings for low-cost and interruptible GPU machines.
 
 * CPU balance. Data-loader workers are sized from the CPUs this process may
   actually use (container limits included), and every process is kept to a

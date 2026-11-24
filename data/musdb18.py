@@ -85,7 +85,7 @@ class MUSDBRandomMixDataset(Dataset):
 
     ``__getitem__`` returns ``(mixture, targets)`` with shapes ``(2, T)`` and
     ``(len(target_stems), 2, T)``. The mixture is always the sum of all four
-    (augmented) stems, whatever ``target_stems`` is.
+    (augmented) stems, regardless of ``target_stems``.
 
     The dataset is "infinite": ``epoch_size`` only defines ``len()``. Random
     draws use Python's ``random`` module, which PyTorch seeds differently in

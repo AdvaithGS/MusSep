@@ -311,8 +311,8 @@ class SubStemGenerator:
         the whole set is always generated (the joint model does this in one pass;
         the cost is the extra slots) and only the requested classes are returned.
         ``project=False`` generates only the requested slots and returns the
-        decoded audio as is: cheaper, but it does not sum to anything and has
-        the VAE's phase, not the recording's.
+        decoded audio as is: faster, but the outputs do not sum to the parent
+        and carry the VAE's phase rather than the recording's.
         """
         taxonomy = self.stage2.taxonomy
         all_names = taxonomy.parent_classes(parent)
